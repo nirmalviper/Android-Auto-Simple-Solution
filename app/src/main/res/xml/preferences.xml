@@ -7,6 +7,10 @@
             android:key="start_stop_ap"
             android:summary="Use another PC to get the BSSID"
             android:title="Start HotSpot" />
+        <Preference
+            android:key="manage_phones"
+            android:summary="Select a preferred phone and review known devices"
+            android:title="Manage Phones" />
     <net.mfuertes.aagw.gateway.EditSummaryPreference
         android:key="MAC_ADDRESS_KEY"
         android:title="P2P0 MAC Address (BSSID)" />

@@ -7,14 +7,21 @@ import android.app.Service
 import android.content.Intent
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import net.mfuertes.aagw.gateway.connectivity.UsbHelper
 import net.mfuertes.aagw.gateway.connectivity.WifiHelper
 import net.mfuertes.aagw.gateway.connectivity.BluetoothProfileHandler
+import net.mfuertes.aagw.gateway.core.GatewayController
+import net.mfuertes.aagw.gateway.core.GatewayPreferences
+import net.mfuertes.aagw.gateway.core.KnownPhone
+import net.mfuertes.aagw.gateway.core.PhoneManager
+import net.mfuertes.aagw.gateway.core.PhonePresenceTracker
 import java.io.*
 import java.net.*
 
@@ -36,6 +43,11 @@ class GatewayService : Service() {
 
     private var mRunning = false
 
+    private val phoneManager = PhoneManager()
+    private val gatewayController = GatewayController(phoneManager)
+    private val gatewayPreferences by lazy { GatewayPreferences(this) }
+    private val presenceTracker = PhonePresenceTracker(phoneManager)
+
     private var mAccessory: UsbAccessory? = null
 
     private var mPhoneInputStream: FileInputStream? = null
@@ -50,6 +62,11 @@ class GatewayService : Service() {
     private var mClientConnectionTimeout = DEFAULT_CONNECTION_TIMEOUT
 
     private val mMainHandlerThread = MainHandlerThread()
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private val presenceCheckHandler = Handler(Looper.getMainLooper())
+    private var reconnectRunnable: Runnable? = null
+    private var reconnectAttempt = 0
+    private var presenceCheckRunnable: Runnable? = null
 
     private val mUsbManager: UsbManager by lazy { getSystemService(UsbManager::class.java) }
     private val mBluetoothProfileHandler: BluetoothProfileHandler by lazy {
@@ -61,6 +78,12 @@ class GatewayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+
+        phoneManager.setKnownPhones(gatewayPreferences.loadKnownPhones())
+        val preferredPhoneId = gatewayPreferences.getPreferredPhoneId()
+        if (preferredPhoneId != null) {
+            phoneManager.setSessionSelection(preferredPhoneId)
+        }
 
         val notificationManager = getSystemService(NotificationManager::class.java)
 
@@ -96,9 +119,19 @@ class GatewayService : Service() {
 
         updateNotification("Started")
 
+        gatewayController.onCarDetected()
+        gatewayController.startInitializing()
+
+        val preferredPhone = phoneManager.selectPhoneForSession()
+        if (preferredPhone != null) {
+            gatewayController.onPhoneSelected(preferredPhone)
+            presenceTracker.onPhoneObserved(preferredPhone)
+        }
+
         mAccessory = intent?.getParcelableExtra(UsbManager.EXTRA_ACCESSORY) as UsbAccessory?
         if (mAccessory == null) {
             Log.e(LOG_TAG, "No USB accessory found")
+            gatewayController.onError()
             stopService()
             return START_REDELIVER_INTENT
         }
@@ -110,26 +143,100 @@ class GatewayService : Service() {
             return START_REDELIVER_INTENT
         }
 
+        beginGatewaySetup()
+
+        return START_REDELIVER_INTENT
+    }
+
+    private fun beginGatewaySetup() {
+        mRunning = true
+        mUsbComplete = false
+        mLocalComplete = false
+
         WifiHelper.startP2pAp(this, mMacAddress!!) { wifiHotspotInfo ->
             Log.d("NATIVE_FLOW", wifiHotspotInfo.toString())
+            val currentPreferredPhone = phoneManager.selectPhoneForSession()
+            if (currentPreferredPhone != null) {
+                presenceTracker.onPhoneObserved(currentPreferredPhone)
+            }
+            gatewayController.onPhoneAvailable()
 
             val pairedDevices = BluetoothProfileHandler.getBondedDevices()
 
             for (device in pairedDevices) {
+                val knownPhone = KnownPhone(
+                    id = device.address ?: device.name ?: "unknown-phone",
+                    name = device.name ?: "Known phone",
+                    bluetoothAddress = device.address,
+                    available = true,
+                    autoConnect = true
+                )
+                phoneManager.upsertKnownPhone(knownPhone)
+                if (currentPreferredPhone == null || currentPreferredPhone.id == knownPhone.id) {
+                    presenceTracker.onPhoneObserved(knownPhone)
+                }
                 mBluetoothProfileHandler.connectDevice(device,
                     DEFAULT_HANDSHAKE_TIMEOUT * 1000L,
                     wifiHotspotInfo
                 )
             }
-            //Manually start AA.
-            mRunning = true
-            mUsbComplete = false
-            mLocalComplete = false
 
+            gatewayController.onConnected()
             mMainHandlerThread.start()
+            schedulePresenceMonitoring()
+        }
+    }
+
+    private fun schedulePresenceMonitoring() {
+        presenceCheckRunnable?.let { presenceCheckHandler.removeCallbacks(it) }
+        presenceCheckRunnable = object : Runnable {
+            override fun run() {
+                val nextState = evaluateCurrentPhonePresence()
+                if (nextState == net.mfuertes.aagw.gateway.core.GatewayState.RECOVERING) {
+                    scheduleReconnectAttempt()
+                }
+                presenceCheckHandler.postDelayed(this, 5000L)
+            }
+        }
+        presenceCheckHandler.postDelayed(presenceCheckRunnable!!, 5000L)
+    }
+
+    private fun scheduleReconnectAttempt() {
+        if (reconnectRunnable != null) {
+            return
         }
 
-        return START_REDELIVER_INTENT
+        reconnectAttempt += 1
+        val delayMs = minOf(30000L, 2000L * reconnectAttempt)
+        reconnectRunnable = Runnable {
+            reconnectRunnable = null
+            if (mRunning) {
+                return@Runnable
+            }
+            updateNotification("Recovering connection (retry in ${delayMs / 1000}s)")
+            gatewayController.onRecoveryNeeded()
+            beginGatewaySetup()
+        }
+        reconnectHandler.postDelayed(reconnectRunnable!!, delayMs)
+    }
+
+    private fun evaluateCurrentPhonePresence(): net.mfuertes.aagw.gateway.core.GatewayState {
+        val selectedId = phoneManager.currentSessionSelectionId() ?: return net.mfuertes.aagw.gateway.core.GatewayState.WAITING_FOR_PHONE
+        val knownPhone = phoneManager.getKnownPhones().firstOrNull { it.id == selectedId }
+        val bondedDevices = BluetoothProfileHandler.getBondedDevices()
+        val bluetoothPresent = knownPhone?.bluetoothAddress != null && bondedDevices.any { it.address == knownPhone.bluetoothAddress }
+        val wifiEnabled = getSystemService(WifiManager::class.java)?.isWifiEnabled == true
+
+        val phoneObserved = bluetoothPresent || wifiEnabled
+        return if (phoneObserved) {
+            presenceTracker.onPhoneObserved(knownPhone ?: KnownPhone(id = selectedId, name = "Recovered phone", bluetoothAddress = selectedId, available = true))
+            gatewayController.onPhoneAvailable()
+            net.mfuertes.aagw.gateway.core.GatewayState.PHONE_SELECTED
+        } else {
+            presenceTracker.onPhoneMissing(selectedId)
+            gatewayController.onRecoveryNeeded()
+            net.mfuertes.aagw.gateway.core.GatewayState.RECOVERING
+        }
     }
 
     private fun onMainHandlerThreadStopped() {
@@ -146,11 +253,24 @@ class GatewayService : Service() {
     private fun stopRunning(msg: String) {
         Log.i(LOG_TAG, msg)
 
-        if (mRunning) {
-            mRunning = false
-            updateNotification("Stopping wireless connection")
+        val selectedPhoneId = phoneManager.currentSessionSelectionId()
+        if (selectedPhoneId != null) {
+            presenceTracker.onPhoneMissing(selectedPhoneId)
+            gatewayController.onPhoneGone()
         }
 
+        mRunning = false
+        reconnectRunnable?.let { reconnectHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        presenceCheckRunnable?.let { presenceCheckHandler.removeCallbacks(it) }
+        presenceCheckRunnable = null
+
+        if (selectedPhoneId != null) {
+            scheduleReconnectAttempt()
+        }
+
+        updateNotification("Stopping wireless connection")
+        gatewayController.resetToWaiting()
         mMainHandlerThread.cancel()
     }
 
